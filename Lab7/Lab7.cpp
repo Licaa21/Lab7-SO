@@ -1,445 +1,443 @@
-/*// Solutie pentru Linux - Fire Albe si Negre cu protectie anti-starvation
-// Compilare: g++ -pthread -o linux_solution linux_solution.cpp
+/*// Solutie Refactorizata Linux - C++ Modern cu Pthreads
 
 #include <pthread.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <queue>
+#include <unistd.h> // Pentru usleep
+#include <iostream>
+#include <vector>
+#include <cstdlib>  // Pentru rand, srand
 
-// Structura pentru a gestiona accesul la resursa
-typedef struct {
+// Definim culorile explicit pentru lizibilitate
+enum class ThreadColor {
+    White,
+    Black
+};
+
+// Clasa care gestioneaza sincronizarea si accesul echitabil
+class FairResourceController {
+private:
     pthread_mutex_t mutex;
     pthread_cond_t cond;
 
-    int white_count;      // Numar de fire albe care folosesc resursa
-    int black_count;      // Numar de fire negre care folosesc resursa
-    int white_waiting;    // Numar de fire albe in asteptare
-    int black_waiting;    // Numar de fire negre in asteptare
+    int white_count = 0;      // Fire albe active
+    int black_count = 0;      // Fire negre active
+    int white_waiting = 0;    // Fire albe in asteptare
+    int black_waiting = 0;    // Fire negre in asteptare
 
-    // Pentru evitarea starvation - sistem de ture
-    int current_turn;     // 0 = alb, 1 = negru, -1 = liber
-    int turn_count;       // Cate fire au folosit resursa in tura curenta
-    int max_per_turn;     // Numar maxim de fire per tura (pentru fairness)
-} ResourceManager;
+    // Variabile pentru controlul anti-starvation (echitate)
+    ThreadColor current_turn_color = ThreadColor::White;
+    bool has_turn = false;    // Indica daca sistemul de ture este activ
+    int turn_counter = 0;     // Cate fire au trecut in tura curenta
+    int max_per_turn;         // Limita maxima inainte de schimbarea fortata a turei
 
-ResourceManager rm;
+    // Logica interna: Verifica permisiunea de acces
+    bool CanAccess(ThreadColor color) {
+        bool is_white = (color == ThreadColor::White);
+        int my_active = is_white ? white_count : black_count;
+        int other_active = is_white ? black_count : white_count;
+        int other_waiting = is_white ? black_waiting : white_waiting;
 
-void init_resource_manager(ResourceManager* rm, int max_per_turn) {
-    pthread_mutex_init(&rm->mutex, NULL);
-    pthread_cond_init(&rm->cond, NULL);
-    rm->white_count = 0;
-    rm->black_count = 0;
-    rm->white_waiting = 0;
-    rm->black_waiting = 0;
-    rm->current_turn = -1;  // Initial liber
-    rm->turn_count = 0;
-    rm->max_per_turn = max_per_turn;
-}
-
-void destroy_resource_manager(ResourceManager* rm) {
-    pthread_mutex_destroy(&rm->mutex);
-    pthread_cond_destroy(&rm->cond);
-}
-
-// Functie pentru a verifica daca un fir poate accesa resursa
-int can_access(ResourceManager* rm, int is_white) {
-    int my_type = is_white ? 0 : 1;
-    int other_count = is_white ? rm->black_count : rm->white_count;
-    int other_waiting = is_white ? rm->black_waiting : rm->white_waiting;
-
-    // Daca tipul opus foloseste resursa, nu putem intra
-    if (other_count > 0) {
-        return 0;
-    }
-
-    // Daca resursa e libera (nimeni nu o foloseste)
-    if (rm->white_count == 0 && rm->black_count == 0) {
-        // Daca nu e tura nimanui sau e tura noastra, putem intra
-        if (rm->current_turn == -1 || rm->current_turn == my_type) {
-            return 1;
+        // 1. Excluziune intre culori (daca opulul e inauntru, asteptam)
+        if (other_active > 0) {
+            return false;
         }
-        // Daca e tura celuilalt tip dar nu asteapta nimeni de acel tip
-        if (other_waiting == 0) {
-            return 1;
+
+        // 2. Daca resursa e libera
+        if (my_active == 0) {
+            // Daca nu e randul nimanui sau e randul meu, intru
+            if (!has_turn || current_turn_color == color) {
+                return true;
+            }
+            // Daca e randul celuilalt, dar nu e nimeni acolo (asteptare 0), intru
+            if (other_waiting == 0) {
+                return true;
+            }
+            return false;
         }
-        return 0;
-    }
 
-    // Resursa e folosita de tipul nostru
-    // Verificam daca nu am depasit limita per tura (anti-starvation)
-    if (rm->turn_count >= rm->max_per_turn && other_waiting > 0) {
-        return 0;  // Trebuie sa dam voie celuilalt tip
-    }
-
-    return 1;
-}
-
-void acquire_resource(ResourceManager* rm, int is_white, int thread_id) {
-    pthread_mutex_lock(&rm->mutex);
-
-    // Incrementam contorul de asteptare
-    if (is_white) {
-        rm->white_waiting++;
-    }
-    else {
-        rm->black_waiting++;
-    }
-
-    // Asteptam pana putem accesa resursa
-    while (!can_access(rm, is_white)) {
-        pthread_cond_wait(&rm->cond, &rm->mutex);
-    }
-
-    // Decrementam contorul de asteptare
-    if (is_white) {
-        rm->white_waiting--;
-        rm->white_count++;
-    }
-    else {
-        rm->black_waiting--;
-        rm->black_count++;
-    }
-
-    // Actualizam tura
-    int my_type = is_white ? 0 : 1;
-    if (rm->current_turn != my_type) {
-        rm->current_turn = my_type;
-        rm->turn_count = 1;
-    }
-    else {
-        rm->turn_count++;
-    }
-
-    printf("[%s %d] A obtinut accesul la resursa (albe: %d, negre: %d)\n",
-        is_white ? "ALB" : "NEGRU", thread_id, rm->white_count, rm->black_count);
-
-    pthread_mutex_unlock(&rm->mutex);
-}
-
-void release_resource(ResourceManager* rm, int is_white, int thread_id) {
-    pthread_mutex_lock(&rm->mutex);
-
-    if (is_white) {
-        rm->white_count--;
-    }
-    else {
-        rm->black_count--;
-    }
-
-    printf("[%s %d] A eliberat resursa (albe: %d, negre: %d)\n",
-        is_white ? "ALB" : "NEGRU", thread_id, rm->white_count, rm->black_count);
-
-    // Daca nu mai e nimeni de tipul nostru, resetam tura
-    int my_count = is_white ? rm->white_count : rm->black_count;
-    if (my_count == 0) {
-        int other_waiting = is_white ? rm->black_waiting : rm->white_waiting;
-        if (other_waiting > 0) {
-            // Dam tura celuilalt tip
-            rm->current_turn = is_white ? 1 : 0;
-            rm->turn_count = 0;
+        // 3. Resursa e folosita deja de culoarea mea
+        // Anti-Starvation: Daca am depasit limita si celalalt asteapta, ma opresc
+        if (turn_counter >= max_per_turn && other_waiting > 0) {
+            return false; 
         }
-        else {
-            rm->current_turn = -1;  // Liber
-        }
+
+        return true;
     }
 
-    // Notificam toate firele care asteapta
-    pthread_cond_broadcast(&rm->cond);
+public:
+    FairResourceController(int max_threads_per_turn) : max_per_turn(max_threads_per_turn) {
+        pthread_mutex_init(&mutex, NULL);
+        pthread_cond_init(&cond, NULL);
+        has_turn = false;
+    }
 
-    pthread_mutex_unlock(&rm->mutex);
-}
+    ~FairResourceController() {
+        pthread_mutex_destroy(&mutex);
+        pthread_cond_destroy(&cond);
+    }
 
-// Structura pentru argumentele firelor
-typedef struct {
-    int thread_id;
-    int is_white;
-} ThreadArgs;
+    // Prevenim copierea obiectului (mutex-urile nu se copiaza)
+    FairResourceController(const FairResourceController&) = delete;
+    FairResourceController& operator=(const FairResourceController&) = delete;
 
-void* thread_function(void* arg) {
-    ThreadArgs* args = (ThreadArgs*)arg;
-    int id = args->thread_id;
-    int is_white = args->is_white;
+    void RequestAccess(ThreadColor color, int thread_id) {
+        pthread_mutex_lock(&mutex);
 
-    printf("[%s %d] Pornit, incearca sa obtina resursa...\n",
-        is_white ? "ALB" : "NEGRU", id);
+        bool is_white = (color == ThreadColor::White);
 
-    // Incearca sa obtina resursa
-    acquire_resource(&rm, is_white, id);
+        // Anuntam intentia de a intra
+        if (is_white) white_waiting++; else black_waiting++;
 
-    // Foloseste resursa (simulare)
-    printf("[%s %d] Foloseste resursa...\n", is_white ? "ALB" : "NEGRU", id);
-    usleep((rand() % 500 + 100) * 1000);  // 100-600ms
+        // Loop de asteptare
+        while (!CanAccess(color)) {
+            pthread_cond_wait(&cond, &mutex);
+        }
 
-    // Elibereaza resursa
-    release_resource(&rm, is_white, id);
+        // Am primit acces
+        if (is_white) {
+            white_waiting--;
+            white_count++;
+        } else {
+            black_waiting--;
+            black_count++;
+        }
 
-    free(args);
+        // Gestionam tura
+        if (!has_turn || current_turn_color != color) {
+            current_turn_color = color;
+            has_turn = true;
+            turn_counter = 1;
+        } else {
+            turn_counter++;
+        }
+
+        printf("[%s %d] -> ACCESS (Activ: A=%d, N=%d)\n", 
+            is_white ? "ALB" : "NEGRU", thread_id, white_count, black_count);
+
+        pthread_mutex_unlock(&mutex);
+    }
+
+    void ReleaseAccess(ThreadColor color, int thread_id) {
+        pthread_mutex_lock(&mutex);
+
+        bool is_white = (color == ThreadColor::White);
+
+        if (is_white) white_count--; else black_count--;
+
+        printf("[%s %d] <- FREE   (Activ: A=%d, N=%d)\n", 
+            is_white ? "ALB" : "NEGRU", thread_id, white_count, black_count);
+
+        // Verificam daca trebuie sa schimbam tura
+        int my_active = is_white ? white_count : black_count;
+        if (my_active == 0) {
+            int other_waiting = is_white ? black_waiting : white_waiting;
+            
+            if (other_waiting > 0) {
+                // Fortam schimbarea turei catre culoarea opusa
+                current_turn_color = is_white ? ThreadColor::Black : ThreadColor::White;
+                has_turn = true;
+                turn_counter = 0;
+            } else {
+                // Nimeni nu asteapta, resursa devine complet libera
+                has_turn = false;
+            }
+        }
+
+        // Notificam toate firele pentru a reevalua conditia CanAccess
+        pthread_cond_broadcast(&cond);
+
+        pthread_mutex_unlock(&mutex);
+    }
+};
+
+// Contextul pasat fiecarui thread
+struct ThreadContext {
+    int id;
+    ThreadColor color;
+    FairResourceController* controller;
+};
+
+// Functia executata de thread
+void* worker_thread(void* arg) {
+    ThreadContext* ctx = static_cast<ThreadContext*>(arg);
+
+    printf("[%s %d] Pornit...\n", ctx->color == ThreadColor::White ? "ALB" : "NEGRU", ctx->id);
+
+    // 1. Request
+    ctx->controller->RequestAccess(ctx->color, ctx->id);
+
+    // 2. Critical Section (Simulare munca)
+    int sleep_time = (rand() % 400 + 100) * 1000; // microsecunde
+    usleep(sleep_time);
+
+    // 3. Release
+    ctx->controller->ReleaseAccess(ctx->color, ctx->id);
+
+    delete ctx; // Curatam memoria alocata pentru context
     return NULL;
 }
 
 int main() {
     srand(time(NULL));
 
-    // Initializam managerul de resurse (max 3 fire per tura pentru fairness)
-    init_resource_manager(&rm, 3);
+    const int NUM_WHITE = 6;
+    const int NUM_BLACK = 6;
+    const int FAIRNESS_LIMIT = 3; // Maxim 3 fire consecutive de aceeasi culoare daca exista opozitie
 
-    const int NUM_WHITE = 5;
-    const int NUM_BLACK = 5;
-    pthread_t threads[NUM_WHITE + NUM_BLACK];
+    FairResourceController controller(FAIRNESS_LIMIT);
+    std::vector<pthread_t> threads;
 
-    printf("=== Pornire test cu %d fire albe si %d fire negre ===\n\n", NUM_WHITE, NUM_BLACK);
+    printf("=== Start Simulare Linux: %d Albe, %d Negre (Fairness: %d) ===\n\n", 
+           NUM_WHITE, NUM_BLACK, FAIRNESS_LIMIT);
 
-    // Cream fire in ordine mixta pentru a testa fairness
-    int thread_idx = 0;
-    for (int i = 0; i < NUM_WHITE || i < NUM_BLACK; i++) {
+    int max_threads = std::max(NUM_WHITE, NUM_BLACK);
+
+    // Lansam firele intercalat
+    for (int i = 0; i < max_threads; ++i) {
         if (i < NUM_WHITE) {
-            ThreadArgs* args = (ThreadArgs*)malloc(sizeof(ThreadArgs));
-            args->thread_id = i + 1;
-            args->is_white = 1;
-            pthread_create(&threads[thread_idx++], NULL, thread_function, args);
-            usleep(50000);  // Mic delay intre crearea firelor
+            ThreadContext* ctx = new ThreadContext{i + 1, ThreadColor::White, &controller};
+            pthread_t t;
+            pthread_create(&t, NULL, worker_thread, ctx);
+            threads.push_back(t);
         }
+        
+        usleep(10000); // Mic delay pentru realism
+
         if (i < NUM_BLACK) {
-            ThreadArgs* args = (ThreadArgs*)malloc(sizeof(ThreadArgs));
-            args->thread_id = i + 1;
-            args->is_white = 0;
-            pthread_create(&threads[thread_idx++], NULL, thread_function, args);
-            usleep(50000);
+            ThreadContext* ctx = new ThreadContext{i + 1, ThreadColor::Black, &controller};
+            pthread_t t;
+            pthread_create(&t, NULL, worker_thread, ctx);
+            threads.push_back(t);
         }
     }
 
-    // Asteptam toate firele
-    for (int i = 0; i < NUM_WHITE + NUM_BLACK; i++) {
-        pthread_join(threads[i], NULL);
+    // Asteptam terminarea tuturor firelor (Join)
+    for (pthread_t& t : threads) {
+        pthread_join(t, NULL);
     }
 
     printf("\n=== Toate firele au terminat ===\n");
 
-    destroy_resource_manager(&rm);
     return 0;
 }*/
-
-// Solutie pentru Windows - Fire Albe si Negre cu protectie anti-starvation
-// Compilare: cl /EHsc windows_solution.cpp
-// sau cu MinGW: g++ -o windows_solution.exe windows_solution.cpp
+// Solutie - C++ Modern cu Windows API
 
 #include <windows.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <random>
 
-// Structura pentru a gestiona accesul la resursa
-typedef struct {
+// Definim culorile pentru claritate
+enum class ThreadColor {
+    White,
+    Black
+};
+
+// Clasa care gestioneaza sincronizarea si accesul la resursa
+class FairResourceController {
+private:
     CRITICAL_SECTION cs;
     CONDITION_VARIABLE cv;
 
-    int white_count;      // Numar de fire albe care folosesc resursa
-    int black_count;      // Numar de fire negre care folosesc resursa
-    int white_waiting;    // Numar de fire albe in asteptare
-    int black_waiting;    // Numar de fire negre in asteptare
+    int white_count = 0;      // Fire albe active
+    int black_count = 0;      // Fire negre active
+    int white_waiting = 0;    // Fire albe in asteptare
+    int black_waiting = 0;    // Fire negre in asteptare
 
-    // Pentru evitarea starvation - sistem de ture
-    int current_turn;     // 0 = alb, 1 = negru, -1 = liber
-    int turn_count;       // Cate fire au folosit resursa in tura curenta
-    int max_per_turn;     // Numar maxim de fire per tura (pentru fairness)
-} ResourceManager;
+    // Variabile pentru controlul starvation (echitate)
+    ThreadColor current_turn_color = ThreadColor::White; // Culoarea care are "tura" curenta
+    bool has_turn = false;    // Daca tura este atribuita activ cuiva
+    int turn_counter = 0;     // Cate fire au trecut in tura curenta
+    int max_per_turn;         // Limita pentru switch
 
-ResourceManager rm;
+    // Logica interna: Verifica daca un fir de o anumita culoare poate intra
+    bool CanAccess(ThreadColor color) {
+        bool is_white = (color == ThreadColor::White);
+        int my_active = is_white ? white_count : black_count;
+        int other_active = is_white ? black_count : white_count;
+        int other_waiting = is_white ? black_waiting : white_waiting;
 
-void init_resource_manager(ResourceManager* rm, int max_per_turn) {
-    InitializeCriticalSection(&rm->cs);
-    InitializeConditionVariable(&rm->cv);
-    rm->white_count = 0;
-    rm->black_count = 0;
-    rm->white_waiting = 0;
-    rm->black_waiting = 0;
-    rm->current_turn = -1;  // Initial liber
-    rm->turn_count = 0;
-    rm->max_per_turn = max_per_turn;
-}
-
-void destroy_resource_manager(ResourceManager* rm) {
-    DeleteCriticalSection(&rm->cs);
-    // Condition variables nu necesita cleanup explicit pe Windows
-}
-
-// Functie pentru a verifica daca un fir poate accesa resursa
-int can_access(ResourceManager* rm, int is_white) {
-    int my_type = is_white ? 0 : 1;
-    int other_count = is_white ? rm->black_count : rm->white_count;
-    int other_waiting = is_white ? rm->black_waiting : rm->white_waiting;
-
-    // Daca tipul opus foloseste resursa, nu putem intra
-    if (other_count > 0) {
-        return 0;
-    }
-
-    // Daca resursa e libera (nimeni nu o foloseste)
-    if (rm->white_count == 0 && rm->black_count == 0) {
-        // Daca nu e tura nimanui sau e tura noastra, putem intra
-        if (rm->current_turn == -1 || rm->current_turn == my_type) {
-            return 1;
+        // 1. Regula de baza: Excluziune reciproca intre culori
+        if (other_active > 0) {
+            return false;
         }
-        // Daca e tura celuilalt tip dar nu asteapta nimeni de acel tip
-        if (other_waiting == 0) {
-            return 1;
+
+        // 2. Daca resursa e libera
+        if (my_active == 0) {
+            // Daca nu e tura nimanui sau e tura mea, intru
+            if (!has_turn || current_turn_color == color) {
+                return true;
+            }
+            // Daca e tura celuilalt, dar nu e nimeni acolo sa o foloseasca, intru (fur tura)
+            if (other_waiting == 0) {
+                return true;
+            }
+            return false;
         }
-        return 0;
-    }
 
-    // Resursa e folosita de tipul nostru
-    // Verificam daca nu am depasit limita per tura (anti-starvation)
-    if (rm->turn_count >= rm->max_per_turn && other_waiting > 0) {
-        return 0;  // Trebuie sa dam voie celuilalt tip
-    }
-
-    return 1;
-}
-
-void acquire_resource(ResourceManager* rm, int is_white, int thread_id) {
-    EnterCriticalSection(&rm->cs);
-
-    // Incrementam contorul de asteptare
-    if (is_white) {
-        rm->white_waiting++;
-    }
-    else {
-        rm->black_waiting++;
-    }
-
-    // Asteptam pana putem accesa resursa
-    while (!can_access(rm, is_white)) {
-        SleepConditionVariableCS(&rm->cv, &rm->cs, INFINITE);
-    }
-
-    // Decrementam contorul de asteptare
-    if (is_white) {
-        rm->white_waiting--;
-        rm->white_count++;
-    }
-    else {
-        rm->black_waiting--;
-        rm->black_count++;
-    }
-
-    // Actualizam tura
-    int my_type = is_white ? 0 : 1;
-    if (rm->current_turn != my_type) {
-        rm->current_turn = my_type;
-        rm->turn_count = 1;
-    }
-    else {
-        rm->turn_count++;
-    }
-
-    printf("[%s %d] A obtinut accesul la resursa (albe: %d, negre: %d)\n",
-        is_white ? "ALB" : "NEGRU", thread_id, rm->white_count, rm->black_count);
-
-    LeaveCriticalSection(&rm->cs);
-}
-
-void release_resource(ResourceManager* rm, int is_white, int thread_id) {
-    EnterCriticalSection(&rm->cs);
-
-    if (is_white) {
-        rm->white_count--;
-    }
-    else {
-        rm->black_count--;
-    }
-
-    printf("[%s %d] A eliberat resursa (albe: %d, negre: %d)\n",
-        is_white ? "ALB" : "NEGRU", thread_id, rm->white_count, rm->black_count);
-
-    // Daca nu mai e nimeni de tipul nostru, resetam tura
-    int my_count = is_white ? rm->white_count : rm->black_count;
-    if (my_count == 0) {
-        int other_waiting = is_white ? rm->black_waiting : rm->white_waiting;
-        if (other_waiting > 0) {
-            // Dam tura celuilalt tip
-            rm->current_turn = is_white ? 1 : 0;
-            rm->turn_count = 0;
+        // 3. Resursa e folosita deja de culoarea mea
+        // Verificam Anti-Starvation: am depasit limita si celalalt asteapta?
+        if (turn_counter >= max_per_turn && other_waiting > 0) {
+            return false; // Cedam locul
         }
-        else {
-            rm->current_turn = -1;  // Liber
-        }
+
+        return true;
     }
 
-    // Notificam toate firele care asteapta
-    WakeAllConditionVariable(&rm->cv);
+public:
+    FairResourceController(int max_threads_per_turn) : max_per_turn(max_threads_per_turn) {
+        InitializeCriticalSection(&cs);
+        InitializeConditionVariable(&cv);
+        has_turn = false;
+    }
 
-    LeaveCriticalSection(&rm->cs);
-}
+    ~FairResourceController() {
+        DeleteCriticalSection(&cs);
+    }
 
-// Structura pentru argumentele firelor
-typedef struct {
-    int thread_id;
-    int is_white;
-} ThreadArgs;
+    // Nu permitem copierea controlerului
+    FairResourceController(const FairResourceController&) = delete;
+    FairResourceController& operator=(const FairResourceController&) = delete;
 
-DWORD WINAPI thread_function(LPVOID arg) {
-    ThreadArgs* args = (ThreadArgs*)arg;
-    int id = args->thread_id;
-    int is_white = args->is_white;
+    void RequestAccess(ThreadColor color, int thread_id) {
+        EnterCriticalSection(&cs);
+        
+        bool is_white = (color == ThreadColor::White);
 
-    printf("[%s %d] Pornit, incearca sa obtina resursa...\n",
-        is_white ? "ALB" : "NEGRU", id);
+        // Incrementam contorul de asteptare
+        if (is_white) white_waiting++; else black_waiting++;
 
-    // Incearca sa obtina resursa
-    acquire_resource(&rm, is_white, id);
+        // Loop de asteptare
+        while (!CanAccess(color)) {
+            SleepConditionVariableCS(&cv, &cs, INFINITE);
+        }
 
-    // Foloseste resursa (simulare)
-    printf("[%s %d] Foloseste resursa...\n", is_white ? "ALB" : "NEGRU", id);
-    Sleep((rand() % 500) + 100);  // 100-600ms
+        // Am primit acces: actualizam contoarele
+        if (is_white) {
+            white_waiting--;
+            white_count++;
+        } else {
+            black_waiting--;
+            black_count++;
+        }
 
-    // Elibereaza resursa
-    release_resource(&rm, is_white, id);
+        // Actualizam logica de tura
+        if (!has_turn || current_turn_color != color) {
+            current_turn_color = color;
+            has_turn = true;
+            turn_counter = 1;
+        } else {
+            turn_counter++;
+        }
 
-    free(args);
+        printf("[%s %d] -> ACCESS (Activ: A=%d, N=%d)\n", 
+            is_white ? "ALB" : "NEGRU", thread_id, white_count, black_count);
+
+        LeaveCriticalSection(&cs);
+    }
+
+    void ReleaseAccess(ThreadColor color, int thread_id) {
+        EnterCriticalSection(&cs);
+
+        bool is_white = (color == ThreadColor::White);
+
+        if (is_white) white_count--; else black_count--;
+
+        printf("[%s %d] <- FREE   (Activ: A=%d, N=%d)\n", 
+            is_white ? "ALB" : "NEGRU", thread_id, white_count, black_count);
+
+        // Daca ultimul fir de culoarea mea a iesit
+        if ((is_white && white_count == 0) || (!is_white && black_count == 0)) {
+            int other_waiting = is_white ? black_waiting : white_waiting;
+            
+            // Daca cineva de culoare opusa asteapta, schimbam tura fortat
+            if (other_waiting > 0) {
+                current_turn_color = is_white ? ThreadColor::Black : ThreadColor::White;
+                has_turn = true;
+                turn_counter = 0;
+            } else {
+                has_turn = false; // Resursa e complet libera
+            }
+        }
+
+        // Trezim toti firele sa verifice conditiile
+        WakeAllConditionVariable(&cv);
+
+        LeaveCriticalSection(&cs);
+    }
+};
+
+// Structura context pentru a pasa date catre thread
+struct ThreadContext {
+    int id;
+    ThreadColor color;
+    FairResourceController* controller;
+};
+
+// Functia thread-ului
+DWORD WINAPI WorkerThread(LPVOID lpParam) {
+    // Preluam contextul si il stergem automat la final (simulat, aici il folosim manual)
+    ThreadContext* ctx = static_cast<ThreadContext*>(lpParam);
+    
+    // 1. Simulare pregatire
+    Sleep(rand() % 100);
+
+    // 2. Cere acces
+    ctx->controller->RequestAccess(ctx->color, ctx->id);
+
+    // 3. Sectiune Critica (Lucru cu resursa)
+    Sleep((rand() % 400) + 100); 
+
+    // 4. Elibereaza acces
+    ctx->controller->ReleaseAccess(ctx->color, ctx->id);
+
+    // Curatenie memorie context
+    delete ctx; 
     return 0;
 }
 
 int main() {
+    // Setup random
     srand((unsigned int)GetTickCount());
 
-    // Initializam managerul de resurse (max 3 fire per tura pentru fairness)
-    init_resource_manager(&rm, 3);
+    // Configurare
+    const int NUM_WHITE = 6;
+    const int NUM_BLACK = 6;
+    const int MAX_FAIRNESS = 3; // Max 3 fire consecutive de aceeasi culoare daca ceilalti asteapta
 
-    const int NUM_WHITE = 5;
-    const int NUM_BLACK = 5;
-    HANDLE threads[NUM_WHITE + NUM_BLACK];
+    FairResourceController controller(MAX_FAIRNESS);
+    std::vector<HANDLE> handles;
 
-    printf("=== Pornire test cu %d fire albe si %d fire negre ===\n\n", NUM_WHITE, NUM_BLACK);
+    printf("=== Start Simulare: %d Albe, %d Negre (Fairness max: %d) ===\n\n", 
+           NUM_WHITE, NUM_BLACK, MAX_FAIRNESS);
 
-    // Cream fire in ordine mixta pentru a testa fairness
-    int thread_idx = 0;
-    for (int i = 0; i < NUM_WHITE || i < NUM_BLACK; i++) {
+    // Lansam firele intercalat pentru a testa contention-ul
+    int max_threads = max(NUM_WHITE, NUM_BLACK);
+    
+    for (int i = 0; i < max_threads; ++i) {
         if (i < NUM_WHITE) {
-            ThreadArgs* args = (ThreadArgs*)malloc(sizeof(ThreadArgs));
-            args->thread_id = i + 1;
-            args->is_white = 1;
-            threads[thread_idx++] = CreateThread(NULL, 0, thread_function, args, 0, NULL);
-            Sleep(50);  // Mic delay intre crearea firelor
+            ThreadContext* ctx = new ThreadContext{ i + 1, ThreadColor::White, &controller };
+            handles.push_back(CreateThread(NULL, 0, WorkerThread, ctx, 0, NULL));
         }
+        
+        // Mic delay ca sa nu porneasca toate exact in aceeasi milisecunda (simulare realista)
+        Sleep(10); 
+
         if (i < NUM_BLACK) {
-            ThreadArgs* args = (ThreadArgs*)malloc(sizeof(ThreadArgs));
-            args->thread_id = i + 1;
-            args->is_white = 0;
-            threads[thread_idx++] = CreateThread(NULL, 0, thread_function, args, 0, NULL);
-            Sleep(50);
+            ThreadContext* ctx = new ThreadContext{ i + 1, ThreadColor::Black, &controller };
+            handles.push_back(CreateThread(NULL, 0, WorkerThread, ctx, 0, NULL));
         }
     }
 
-    // Asteptam toate firele
-    WaitForMultipleObjects(NUM_WHITE + NUM_BLACK, threads, TRUE, INFINITE);
+    // Asteptam terminarea tuturor
+    WaitForMultipleObjects((DWORD)handles.size(), handles.data(), TRUE, INFINITE);
 
     // Inchidem handle-urile
-    for (int i = 0; i < NUM_WHITE + NUM_BLACK; i++) {
-        CloseHandle(threads[i]);
+    for (HANDLE h : handles) {
+        CloseHandle(h);
     }
 
-    printf("\n=== Toate firele au terminat ===\n");
+    printf("\n=== Simulare Finalizata ===\n");
 
-    destroy_resource_manager(&rm);
     return 0;
 }
